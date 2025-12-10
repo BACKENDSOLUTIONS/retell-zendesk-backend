@@ -1,0 +1,52 @@
+# =====================================
+# Node.js / Express Backend Ignore File
+# =====================================
+
+# Node dependencies
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Environment variables (VERY IMPORTANT!)
+.env
+.env.*
+.env.local
+.env.development
+.env.production
+
+# Logs
+logs
+*.log
+debug.log
+error.log
+*.out
+*.err
+
+# Build output
+dist/
+build/
+.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+
+# Local environment overrides
+*.local
+
+# Render build artifacts
+render.yaml
+.renderrc
+
+# Optional: ignore coverage reports
+coverage/
+
+# Optional: backups
+*.bak
+*.tmp
