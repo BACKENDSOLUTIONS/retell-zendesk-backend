@@ -4,7 +4,9 @@ const app = express();
 
 app.use(express.json());
 
+// ------------------------
 // Health-check endpoint
+// ------------------------
 app.get("/", (req, res) => {
   res.send("Retell → Zendesk backend is running.");
 });
@@ -15,7 +17,7 @@ app.get("/", (req, res) => {
 app.post("/create-ticket", async (req, res) => {
   try {
     // Подивитися, що саме приходить від Retell (можна потім видалити)
-    console.log("Incoming body from Retell:", JSON.stringify(req.body, null, 2));
+    console.log("Incoming body from Retell (create-ticket):", JSON.stringify(req.body, null, 2));
 
     // Працюємо з різними варіантами структури
     const raw = req.body || {};
@@ -60,6 +62,8 @@ app.post("/create-ticket", async (req, res) => {
     const data = await response.json();
     const ticketId = data.ticket?.id;
 
+    console.log("Zendesk ticket created:", ticketId);
+
     res.json({
       success: true,
       ticket_id: ticketId,
@@ -79,16 +83,41 @@ app.post("/retell-webhook", async (req, res) => {
     console.log("Incoming Retell webhook:", JSON.stringify(req.body, null, 2));
 
     const body = req.body || {};
+    const call = body.call || {};
 
-    // Retell зазвичай кладе змінні функцій сюди
-    const variables = body.variables || body.call_variables || {};
-    const ticket_id = variables.ticket_id;
+    // Якщо Retell шле різні типи подій, можна фільтрувати тільки фінальний аналіз
+    // if (body.event && body.event !== "call_analyzed") {
+    //   return res.json({ success: true, message: "Ignored non analyzed event" });
+    // }
 
-    // Пробуємо знайти транскрипт у різних можливих полях
+    // -----------------------------
+    // 1) Дістаємо ticket_id
+    // -----------------------------
+    const variables =
+      body.variables ||
+      body.call_variables ||
+      call.call_variables ||
+      call.variables ||
+      call.dynamic_variables ||
+      call.metadata ||
+      {};
+
+    const ticket_id =
+      variables.ticket_id ||
+      body.ticket_id ||
+      call.ticket_id ||
+      null;
+
+    // -----------------------------
+    // 2) Дістаємо транскрипт
+    // -----------------------------
     const transcript =
       body.transcript ||
       body.full_transcript ||
-      (body.call && (body.call.transcript || body.call.full_transcript)) ||
+      call.transcript ||
+      call.full_transcript ||
+      body.text ||
+      body.summary_text ||
       "";
 
     if (!ticket_id || !transcript) {
@@ -102,6 +131,8 @@ app.post("/retell-webhook", async (req, res) => {
         message: "ticket_id or transcript not found in webhook payload",
       });
     }
+
+    console.log(`Appending transcript to ticket ${ticket_id} (length=${transcript.length})`);
 
     // Додаємо транскрипт як внутрішній коментар у вже створений тікет
     const response = await fetch(
