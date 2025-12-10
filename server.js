@@ -17,7 +17,7 @@ app.get("/", (req, res) => {
 app.post("/create-ticket", async (req, res) => {
   try {
     // Подивитися, що саме приходить від Retell (можна потім видалити)
-    console.log("Incoming body from Retell (create-ticket):", JSON.stringify(req.body, null, 2));
+    console.log("Incoming body from Retell:", JSON.stringify(req.body, null, 2));
 
     // Працюємо з різними варіантами структури
     const raw = req.body || {};
@@ -64,6 +64,8 @@ app.post("/create-ticket", async (req, res) => {
 
     console.log("Zendesk ticket created:", ticketId);
 
+    // Дуже важливо: повертаємо ticket_id в JSON,
+    // Retell збереже це у call.retell_llm_dynamic_variables.ticket_id
     res.json({
       success: true,
       ticket_id: ticketId,
@@ -83,42 +85,33 @@ app.post("/retell-webhook", async (req, res) => {
     console.log("Incoming Retell webhook:", JSON.stringify(req.body, null, 2));
 
     const body = req.body || {};
-    const call = body.call || {};
+    const { event, call } = body;
 
-    // Якщо Retell шле різні типи подій, можна фільтрувати тільки фінальний аналіз
-    // if (body.event && body.event !== "call_analyzed") {
-    //   return res.json({ success: true, message: "Ignored non analyzed event" });
-    // }
+    if (!call) {
+      console.log("No call object in webhook payload");
+      return res.json({
+        success: false,
+        message: "no call object in webhook payload",
+      });
+    }
 
-    // -----------------------------
-    // 1) Дістаємо ticket_id
-    // -----------------------------
-    const variables =
-      body.variables ||
-      body.call_variables ||
-      call.call_variables ||
-      call.variables ||
-      call.dynamic_variables ||
-      call.metadata ||
-      {};
-
+    // ticket_id, який повернула наша функція create_ticket,
+    // Retell кладе в call.retell_llm_dynamic_variables
     const ticket_id =
-      variables.ticket_id ||
-      body.ticket_id ||
-      call.ticket_id ||
-      null;
+      call.retell_llm_dynamic_variables?.ticket_id ||
+      call.metadata?.ticket_id ||
+      call.variables?.ticket_id;
 
-    // -----------------------------
-    // 2) Дістаємо транскрипт
-    // -----------------------------
+    // Транскрипт дзвінка – за докою це call.transcript
     const transcript =
-      body.transcript ||
-      body.full_transcript ||
       call.transcript ||
-      call.full_transcript ||
-      body.text ||
-      body.summary_text ||
+      call.call_analysis?.transcript ||
       "";
+
+    console.log("Parsed from webhook:", {
+      ticket_id,
+      hasTranscript: !!transcript,
+    });
 
     if (!ticket_id || !transcript) {
       console.log("Missing ticket_id or transcript in webhook payload", {
@@ -131,8 +124,6 @@ app.post("/retell-webhook", async (req, res) => {
         message: "ticket_id or transcript not found in webhook payload",
       });
     }
-
-    console.log(`Appending transcript to ticket ${ticket_id} (length=${transcript.length})`);
 
     // Додаємо транскрипт як внутрішній коментар у вже створений тікет
     const response = await fetch(
@@ -168,7 +159,9 @@ app.post("/retell-webhook", async (req, res) => {
   }
 });
 
-// IMPORTANT: Render provides the PORT via environment variable
+// ------------------------
+// Start server
+// ------------------------
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
