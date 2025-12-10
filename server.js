@@ -12,8 +12,20 @@ app.get("/", (req, res) => {
 // Create-ticket endpoint
 app.post("/create-ticket", async (req, res) => {
   try {
-    const { name, email, issue_description, serial_number, car_model } = req.body;
+    // Подивитися, що саме приходить від Retell (можна потім видалити)
+console.log("Incoming body from Retell:", JSON.stringify(req.body, null, 2));
 
+// Працюємо з різними варіантами структури
+const raw = req.body || {};
+const args = raw.args || raw.arguments || raw.parameters || raw;
+
+const {
+  name,
+  email,
+  issue_description,
+  serial_number,
+  car_model,
+} = args || {};
     const response = await fetch(
       `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json`,
       {
@@ -56,3 +68,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
