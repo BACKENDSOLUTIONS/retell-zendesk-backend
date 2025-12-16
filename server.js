@@ -82,7 +82,7 @@ app.post("/create-ticket", async (req, res) => {
 // -------------------------------------------
 app.post("/retell-webhook", async (req, res) => {
   try {
-    console.log("Incoming Retell webhook:", JSON.stringify(req.body, null, 2));
+    console.log("Incoming Retell webhook RAW:", JSON.stringify(req.body));
 
     const body = req.body || {};
     const { event, call } = body;
@@ -167,3 +167,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
