@@ -27,36 +27,6 @@ const MAX_VARS_JSON_CHARS = 6000;
 const MAX_CALL_SUMMARY_CHARS = 6000;
 const MAX_QA_BODY_CHARS = 60000;
 
-// Webhook de-duplication window (ms)
-const WEBHOOK_DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
-
-// ------------------------
-// Simple in-memory de-dup store (per running instance)
-// ------------------------
-const processedCallAnalyzed = new Map(); // call_id -> timestamp
-
-function markProcessed(call_id) {
-  if (!call_id) return;
-  processedCallAnalyzed.set(call_id, Date.now());
-}
-function isProcessed(call_id) {
-  if (!call_id) return false;
-  const ts = processedCallAnalyzed.get(call_id);
-  if (!ts) return false;
-  if (Date.now() - ts > WEBHOOK_DEDUP_TTL_MS) {
-    processedCallAnalyzed.delete(call_id);
-    return false;
-  }
-  return true;
-}
-function cleanupProcessed() {
-  const now = Date.now();
-  for (const [k, ts] of processedCallAnalyzed.entries()) {
-    if (now - ts > WEBHOOK_DEDUP_TTL_MS) processedCallAnalyzed.delete(k);
-  }
-}
-setInterval(cleanupProcessed, 60 * 1000).unref?.();
-
 // ------------------------
 // Health-check endpoint
 // ------------------------
@@ -101,9 +71,7 @@ function didTransfer(call) {
   const twtc = call?.transcript_with_tool_calls;
   if (Array.isArray(twtc)) {
     const has = twtc.some(
-      (e) =>
-        e?.role === "tool_call_invocation" &&
-        safeLower(e?.name).includes("transfer")
+      (e) => e?.role === "tool_call_invocation" && safeLower(e?.name).includes("transfer")
     );
     if (has) return true;
   }
@@ -121,9 +89,7 @@ function detectRequestedHuman(transcript) {
   const t = safeLower(transcript);
 
   const en =
-    /\b(human|real person|live agent|representative|talk to someone|speak to someone|agent)\b/.test(
-      t
-    );
+    /\b(human|real person|live agent|representative|talk to someone|speak to someone|agent)\b/.test(t);
 
   const ua =
     /(жив(ий|ого)\s+агент|оператор|людин(а|у)|менеджер|з’єднай|з'єднай|переведи)/i.test(
@@ -169,6 +135,24 @@ function getBusinessHoursNow() {
   };
 }
 
+function getCallAnalysisObject(call) {
+  const ca = call?.call_analysis;
+
+  // Sometimes providers send stringified JSON; handle both.
+  if (!ca) return null;
+  if (typeof ca === "object") return ca;
+
+  if (typeof ca === "string") {
+    try {
+      return JSON.parse(ca);
+    } catch {
+      return { __parse_error: true, raw: ca };
+    }
+  }
+
+  return null;
+}
+
 function buildQaPayload(call) {
   const callId = call?.call_id || "N/A";
   const agentName = call?.agent_name || "N/A";
@@ -181,11 +165,14 @@ function buildQaPayload(call) {
   const transcriptRaw = call?.transcript || "";
   const transcript = truncate(transcriptRaw, MAX_TRANSCRIPT_CHARS);
 
-  // call_analysis is typically available on call_analyzed, might be empty on call_ended
-  const callSummaryRaw =
-    call?.call_analysis?.call_summary ||
-    call?.call_analysis?.call_summary_text ||
-    "";
+  const ca = getCallAnalysisObject(call);
+
+  let callSummaryRaw = "";
+  if (ca?.__parse_error) {
+    callSummaryRaw = "Error in parsing JSON for call analysis";
+  } else {
+    callSummaryRaw = ca?.call_summary || ca?.call_summary_text || "";
+  }
 
   const callSummary = truncate(callSummaryRaw, MAX_CALL_SUMMARY_CHARS);
   const varsJson = safeJson(vars, MAX_VARS_JSON_CHARS);
@@ -221,7 +208,8 @@ function computeTags(call) {
 
   if (call?.call_type) tags.add(`calltype_${safeLower(call.call_type)}`);
 
-  const inVoicemail = !!call?.call_analysis?.in_voicemail;
+  const ca = getCallAnalysisObject(call);
+  const inVoicemail = !!ca?.in_voicemail;
   tags.add(inVoicemail ? "voicemail_yes" : "voicemail_no");
 
   const transferred = didTransfer(call);
@@ -230,7 +218,7 @@ function computeTags(call) {
   const transcript = call?.transcript || "";
   const requestedHuman = detectRequestedHuman(transcript);
 
-  const userSentiment = safeLower(call?.call_analysis?.user_sentiment);
+  const userSentiment = safeLower(ca?.user_sentiment);
   if (userSentiment) tags.add(`sentiment_${userSentiment}`);
   else tags.add("sentiment_unknown");
 
@@ -248,7 +236,7 @@ function computeTags(call) {
     }
   }
 
-  const callSuccessful = call?.call_analysis?.call_successful;
+  const callSuccessful = ca?.call_successful;
   const hasCallSuccessful = typeof callSuccessful === "boolean";
 
   let outcome = "ai_resolved";
@@ -273,9 +261,6 @@ function computeTags(call) {
   tags.add(outcome);
 
   if (requestedHuman) tags.add("requested_human");
-
-  // Add call id tag if possible (very useful for matching)
-  if (call?.call_id) tags.add(`callid_${normalizeCallId(call.call_id)}`);
 
   return Array.from(tags);
 }
@@ -307,6 +292,11 @@ async function zendeskRequest(path, method, bodyObj) {
   return { ok: resp.ok, status: resp.status, data };
 }
 
+/**
+ * Backup linking strategy (NO ticket creation):
+ * Find escalation ticket by callid_... tag, so webhook can attach transcript
+ * even if ticket_id dynamic var is missing.
+ */
 async function findTicketIdByCallIdTag(call_id) {
   if (!call_id) return null;
 
@@ -324,42 +314,18 @@ async function findTicketIdByCallIdTag(call_id) {
   return first?.id || null;
 }
 
-async function createQaTicketFromWebhook(call) {
-  const callId = call?.call_id || "N/A";
-  const qaBody = buildQaPayload(call);
-  const tagsToAdd = computeTags(call);
-
-  // IMPORTANT: DO NOT set requester here (Zendesk can reject support emails)
-  const payload = {
-    ticket: {
-      subject: `AI Voice Call Review — ${callId}`,
-      comment: { body: qaBody, public: false },
-      tags: tagsToAdd,
-    },
-  };
-
-  const { ok, status, data } = await zendeskRequest("/tickets.json", "POST", payload);
-  if (!ok) {
-    throw new Error(
-      `Failed to create QA ticket. Zendesk status=${status} body=${JSON.stringify(data).slice(0, 1200)}`
-    );
-  }
-  return data.ticket?.id;
-}
-
 // ------------------------
 // Business-hours function for Retell
 // ------------------------
 app.post("/check-business-hours", (req, res) => {
   try {
     const info = getBusinessHoursNow();
-
-    const call_id = req.body?.call_id || req.body?.args?.call_id || null;
+    const call_id = req.body?.call_id || req.body?.args?.call_id;
     console.log("check-business-hours:", { call_id, ...info });
-
     res.json(info);
   } catch (err) {
     console.error("Error in /check-business-hours:", err);
+    // safest fallback: outside business hours
     res.json({
       business_hours: false,
       weekday: "Unknown",
@@ -373,7 +339,7 @@ app.post("/check-business-hours", (req, res) => {
 // ------------------------
 // Create ticket from Retell (function create_ticket)
 // serial_number removed, phone added
-// NOTE: call_id is IMPORTANT for webhook matching
+// IMPORTANT: tag the ticket with call_id so webhook can link reliably
 // ------------------------
 app.post("/create-ticket", async (req, res) => {
   try {
@@ -382,15 +348,7 @@ app.post("/create-ticket", async (req, res) => {
     const raw = req.body || {};
     const args = raw.args || raw.arguments || raw.parameters || raw;
 
-    // Try to grab call id from many possible places
-    const call_id =
-      args?.call_id ||
-      raw?.call_id ||
-      raw?.call?.call_id ||
-      raw?.metadata?.call_id ||
-      null;
-
-    const { name, email, issue_description, phone, car_model } = args || {};
+    const { name, email, issue_description, phone, car_model, call_id } = args || {};
 
     const bodyText =
       `Issue Description:\n${issue_description || "N/A"}\n\n` +
@@ -413,7 +371,8 @@ app.post("/create-ticket", async (req, res) => {
       },
     };
 
-    // Only set requester if email is valid, otherwise OMIT requester (avoid Zendesk 422)
+    // Only set requester if email is actually valid.
+    // If empty/invalid -> omit requester entirely to avoid Zendesk 422.
     if (isValidEmail(email)) {
       payload.ticket.requester = {
         name: name || "Customer",
@@ -422,29 +381,30 @@ app.post("/create-ticket", async (req, res) => {
     }
 
     const { ok, status, data } = await zendeskRequest("/tickets.json", "POST", payload);
+
     if (!ok) {
       console.error("Zendesk ticket create failed:", status, data);
       return res.status(500).json({ success: false, status, zendesk_response: data });
     }
 
     const ticketId = data.ticket?.id;
-    console.log("Zendesk ticket created:", ticketId, { call_id });
+    console.log("Zendesk escalation ticket created:", ticketId);
 
-    res.json({
+    // Retell should save this into a dynamic variable (ticket_id).
+    return res.json({
       success: true,
       ticket_id: ticketId,
-      call_id: call_id || null,
-      zendesk_response: data,
     });
   } catch (err) {
     console.error("Error in /create-ticket:", err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
 // -------------------------------------------
 // Webhook from Retell after call
-// IMPORTANT: process ONLY call_analyzed to avoid duplicates
+// IMPORTANT: We only process "call_analyzed" to avoid duplicate comments.
+// We NEVER create new tickets from webhook.
 // -------------------------------------------
 app.post("/retell-webhook", async (req, res) => {
   try {
@@ -461,57 +421,37 @@ app.post("/retell-webhook", async (req, res) => {
       disconnection_reason: call?.disconnection_reason,
     });
 
-    // Always ACK quickly if no call object
-    if (!call) {
-      return res.json({ success: false, message: "no call object in webhook payload" });
-    }
+    // Always acknowledge quickly to avoid retries
+    if (!call) return res.json({ success: true });
 
-    // *** KEY FIX: ignore everything except call_analyzed ***
-    // This prevents: (1) duplicate QA tickets, (2) premature updates without analysis.
+    // Dedup: only handle call_analyzed
     if (event !== "call_analyzed") {
-      return res.json({ success: true, ignored: true, reason: "Only call_analyzed is processed" });
+      return res.json({ success: true, skipped: `event_${event}` });
     }
 
-    const call_id = call?.call_id || null;
-
-    // De-dup: Retell can retry webhooks
-    if (call_id && isProcessed(call_id)) {
-      console.log("Duplicate call_analyzed ignored (already processed):", call_id);
-      return res.json({ success: true, ignored: true, reason: "dedup", call_id });
-    }
-
-    // Mark processed early to avoid double-processing on retries
-    if (call_id) markProcessed(call_id);
-
-    // 1) Try ticket_id from Retell dynamic variables (best case)
+    // 1) Best: ticket_id from Retell dynamic variables
     let ticket_id =
       call.retell_llm_dynamic_variables?.ticket_id ||
       call.metadata?.ticket_id ||
-      call.variables?.ticket_id ||
-      null;
+      call.variables?.ticket_id;
 
-    // 2) If missing, match by call_id tag (requires create_ticket to include call_id)
-    if (!ticket_id && call_id) {
-      console.log("No ticket_id found. Trying to find ticket by call_id tag...");
-      ticket_id = await findTicketIdByCallIdTag(call_id);
-      if (ticket_id) console.log("Found ticket by call_id tag:", ticket_id);
+    // 2) Backup: find by call_id tag (if create_ticket had call_id)
+    if (!ticket_id && call?.call_id) {
+      console.log("No ticket_id in webhook. Trying to find escalation ticket by call_id tag...");
+      ticket_id = await findTicketIdByCallIdTag(call.call_id);
     }
 
-    // 3) If still missing, create a standalone QA ticket (one per call)
+    // 3) If still no ticket -> do nothing (DO NOT create any ticket here)
     if (!ticket_id) {
-      console.log("No ticket match found. Creating standalone QA ticket...");
-      const qaTicketId = await createQaTicketFromWebhook(call);
-      console.log("Standalone QA ticket created:", qaTicketId);
-      return res.json({ success: true, created_qa_ticket: true, ticket_id: qaTicketId });
+      console.log("No escalation ticket found for this call. Skipping QA attach.");
+      return res.json({ success: true, skipped: "no_ticket_to_update" });
     }
 
-    // Update existing ticket with QA data (transcript + summary + tags)
     const qaBody = buildQaPayload(call);
     const tagsToAdd = computeTags(call);
 
-    console.log("Updating ticket with QA data:", {
+    console.log("Attaching QA payload to existing ticket:", {
       ticket_id,
-      call_id,
       tagsToAddCount: tagsToAdd.length,
     });
 
@@ -533,11 +473,11 @@ app.post("/retell-webhook", async (req, res) => {
       return res.status(500).json({ success: false, status, zendesk_response: data });
     }
 
-    console.log("Ticket updated with QA data:", data.ticket?.id);
-    return res.json({ success: true, zendesk_response: data });
+    console.log("Ticket updated with transcript/summary:", data.ticket?.id);
+    return res.json({ success: true });
   } catch (err) {
     console.error("Error in /retell-webhook:", err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -550,7 +490,7 @@ app.use((err, req, res, next) => {
     return res.status(413).json({ success: false, error: "Payload too large" });
   }
   console.error("Unhandled server error:", err);
-  res.status(500).json({ success: false, error: err.message || "Server error" });
+  return res.status(500).json({ success: false, error: err.message || "Server error" });
 });
 
 // ------------------------
