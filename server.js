@@ -17,16 +17,21 @@ const EARLY_HANGUP_THRESHOLD_SEC = 20;
 
 // Business hours config (America/Los_Angeles)
 const BH_TIMEZONE = "America/Los_Angeles";
-const BH_OPEN_HOUR = 8;  // 08:00
+const BH_OPEN_HOUR = 8; // 08:00
 const BH_CLOSE_HOUR = 20; // 20:00 (end-exclusive)
 const BH_OPEN_MIN = 0;
 const BH_CLOSE_MIN = 0;
 
+// ✅ IMPORTANT: Must be a VALID email for Zendesk requester validation
+// Use your real domain here.
+const QA_REQUESTER_NAME = "AI Call Review";
+const QA_REQUESTER_EMAIL = "support@eviqo.io"; // <-- CHANGE if needed, but keep it valid
+
 // Safety limits for Zendesk comment body
-const MAX_TRANSCRIPT_CHARS = 30000;      // safe-ish
-const MAX_VARS_JSON_CHARS = 6000;        // collected variables block
-const MAX_CALL_SUMMARY_CHARS = 6000;     // call summary
-const MAX_QA_BODY_CHARS = 60000;         // final QA comment (hard cap)
+const MAX_TRANSCRIPT_CHARS = 30000; // safe-ish
+const MAX_VARS_JSON_CHARS = 6000; // collected variables block
+const MAX_CALL_SUMMARY_CHARS = 6000; // call summary
+const MAX_QA_BODY_CHARS = 60000; // final QA comment (hard cap)
 
 // ------------------------
 // Health-check endpoint
@@ -54,7 +59,7 @@ function safeJson(obj, maxChars) {
     const s = JSON.stringify(obj ?? {}, null, 2);
     return truncate(s, maxChars);
   } catch {
-    return "{\n  \"error\": \"failed to stringify\"\n}";
+    return '{\n  "error": "failed to stringify"\n}';
   }
 }
 
@@ -122,14 +127,21 @@ function getBusinessHoursNow() {
   const weekday = part("weekday") || "Unknown";
   const hh = parseInt(part("hour") || "0", 10);
   const mm = parseInt(part("minute") || "0", 10);
-  const time_hhmm = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+  const time_hhmm = `${String(hh).padStart(2, "0")}:${String(mm).padStart(
+    2,
+    "0"
+  )}`;
 
   // Mon-Sat only
-  const isWorkingDay = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].includes(weekday);
+  const isWorkingDay = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].includes(
+    weekday
+  );
 
   // >= 08:00 and < 20:00
-  const afterOpen = hh > BH_OPEN_HOUR || (hh === BH_OPEN_HOUR && mm >= BH_OPEN_MIN);
-  const beforeClose = hh < BH_CLOSE_HOUR || (hh === BH_CLOSE_HOUR && mm < BH_CLOSE_MIN);
+  const afterOpen =
+    hh > BH_OPEN_HOUR || (hh === BH_OPEN_HOUR && mm >= BH_OPEN_MIN);
+  const beforeClose =
+    hh < BH_CLOSE_HOUR || (hh === BH_CLOSE_HOUR && mm < BH_CLOSE_MIN);
 
   const business_hours = isWorkingDay && afterOpen && beforeClose;
 
@@ -214,7 +226,8 @@ function computeTags(call) {
   const disconnectionReason = safeLower(call?.disconnection_reason);
 
   const userHungUp =
-    disconnectionReason.includes("user") || disconnectionReason.includes("client");
+    disconnectionReason.includes("user") ||
+    disconnectionReason.includes("client");
 
   // Hangup classification
   if (userHungUp) {
@@ -250,7 +263,11 @@ function computeTags(call) {
 
   // IMPORTANT exception:
   // early_hangup should not automatically mark failed (often "no-chance")
-  if (tags.has("ai_early_hangup") && !requestedHuman && userSentiment !== "negative") {
+  if (
+    tags.has("ai_early_hangup") &&
+    !requestedHuman &&
+    userSentiment !== "negative"
+  ) {
     outcome = "ai_resolved";
     tags.add("ai_no_chance");
   }
@@ -271,7 +288,9 @@ async function zendeskRequest(path, method, bodyObj) {
   const token = process.env.ZENDESK_API_TOKEN;
 
   if (!subdomain || !email || !token) {
-    throw new Error("Missing Zendesk env vars (ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN)");
+    throw new Error(
+      "Missing Zendesk env vars (ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN)"
+    );
   }
 
   const url = `https://${subdomain}.zendesk.com/api/v2${path}`;
@@ -303,16 +322,24 @@ async function createQaTicketFromWebhook(call) {
         public: false,
       },
       requester: {
-        name: "AI Call Review",
-        email: "ai-review@internal",
+        name: QA_REQUESTER_NAME,
+        email: QA_REQUESTER_EMAIL, // ✅ valid now
       },
       tags: tagsToAdd,
     },
   };
 
-  const { ok, status, data } = await zendeskRequest("/tickets.json", "POST", payload);
+  const { ok, status, data } = await zendeskRequest(
+    "/tickets.json",
+    "POST",
+    payload
+  );
   if (!ok) {
-    throw new Error(`Failed to create QA ticket. Zendesk status=${status} body=${JSON.stringify(data).slice(0, 1000)}`);
+    throw new Error(
+      `Failed to create QA ticket. Zendesk status=${status} body=${JSON.stringify(
+        data
+      ).slice(0, 1000)}`
+    );
   }
   return data.ticket?.id;
 }
@@ -348,7 +375,10 @@ app.post("/check-business-hours", (req, res) => {
 // ------------------------
 app.post("/create-ticket", async (req, res) => {
   try {
-    console.log("Incoming body from Retell (/create-ticket):", JSON.stringify(req.body, null, 2));
+    console.log(
+      "Incoming body from Retell (/create-ticket):",
+      JSON.stringify(req.body, null, 2)
+    );
 
     const raw = req.body || {};
     const args = raw.args || raw.arguments || raw.parameters || raw;
@@ -371,23 +401,29 @@ app.post("/create-ticket", async (req, res) => {
           public: false,
         },
         requester: {
-          name: name || "AI Call Review",
-          email: email || "ai-review@internal",
+          name: name || QA_REQUESTER_NAME,
+          // ✅ if customer didn't provide email, we still must send a VALID email to Zendesk
+          email: email || QA_REQUESTER_EMAIL,
         },
         tags: ["retell_ai", "voice_bot", "ai_call_review"],
       },
     };
 
-    const { ok, status, data } = await zendeskRequest("/tickets.json", "POST", payload);
+    const { ok, status, data } = await zendeskRequest(
+      "/tickets.json",
+      "POST",
+      payload
+    );
     if (!ok) {
       console.error("Zendesk ticket create failed:", status, data);
-      return res.status(500).json({ success: false, status, zendesk_response: data });
+      return res
+        .status(500)
+        .json({ success: false, status, zendesk_response: data });
     }
 
     const ticketId = data.ticket?.id;
     console.log("Zendesk ticket created:", ticketId);
 
-    // Retell can store ticket_id in dynamic variables if configured on their side
     res.json({
       success: true,
       ticket_id: ticketId,
@@ -404,7 +440,6 @@ app.post("/create-ticket", async (req, res) => {
 // -------------------------------------------
 app.post("/retell-webhook", async (req, res) => {
   try {
-    // Do NOT log full body (can be huge) — log only high-level info
     const body = req.body || {};
     const call = body.call;
 
@@ -418,7 +453,10 @@ app.post("/retell-webhook", async (req, res) => {
     });
 
     if (!call) {
-      return res.json({ success: false, message: "no call object in webhook payload" });
+      return res.json({
+        success: false,
+        message: "no call object in webhook payload",
+      });
     }
 
     let ticket_id =
@@ -426,7 +464,7 @@ app.post("/retell-webhook", async (req, res) => {
       call.metadata?.ticket_id ||
       call.variables?.ticket_id;
 
-    // If no ticket_id, create a QA ticket automatically (per your prompt logic)
+    // If no ticket_id, create a QA ticket automatically
     if (!ticket_id) {
       console.log("No ticket_id found in payload. Creating QA ticket...");
       ticket_id = await createQaTicketFromWebhook(call);
@@ -434,11 +472,14 @@ app.post("/retell-webhook", async (req, res) => {
       return res.json({ success: true, created_qa_ticket: true, ticket_id });
     }
 
-    // Update existing ticket with QA data
+    // Update existing ticket with QA data (transcript + summary + tags)
     const qaBody = buildQaPayload(call);
     const tagsToAdd = computeTags(call);
 
-    console.log("Updating ticket with QA data:", { ticket_id, tagsToAddCount: tagsToAdd.length });
+    console.log("Updating ticket with QA data:", {
+      ticket_id,
+      tagsToAddCount: tagsToAdd.length,
+    });
 
     const updatePayload = {
       ticket: {
@@ -450,10 +491,16 @@ app.post("/retell-webhook", async (req, res) => {
       },
     };
 
-    const { ok, status, data } = await zendeskRequest(`/tickets/${ticket_id}.json`, "PUT", updatePayload);
+    const { ok, status, data } = await zendeskRequest(
+      `/tickets/${ticket_id}.json`,
+      "PUT",
+      updatePayload
+    );
     if (!ok) {
       console.error("Zendesk ticket update failed:", status, data);
-      return res.status(500).json({ success: false, status, zendesk_response: data });
+      return res
+        .status(500)
+        .json({ success: false, status, zendesk_response: data });
     }
 
     console.log("Ticket updated with QA data:", data.ticket?.id);
