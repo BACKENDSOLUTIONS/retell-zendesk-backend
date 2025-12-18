@@ -4,9 +4,8 @@ const fetch = require("node-fetch");
 const app = express();
 
 /**
- * IMPORTANT:
  * Retell webhooks can be large (transcript + tool calls + analysis).
- * Default express.json limit is small and causes 413 "Payload Too Large".
+ * If limit is small => 413 Payload Too Large.
  */
 app.use(express.json({ limit: "10mb" }));
 
@@ -17,21 +16,16 @@ const EARLY_HANGUP_THRESHOLD_SEC = 20;
 
 // Business hours config (America/Los_Angeles)
 const BH_TIMEZONE = "America/Los_Angeles";
-const BH_OPEN_HOUR = 8; // 08:00
+const BH_OPEN_HOUR = 8;   // 08:00
 const BH_CLOSE_HOUR = 20; // 20:00 (end-exclusive)
 const BH_OPEN_MIN = 0;
 const BH_CLOSE_MIN = 0;
 
-// ✅ IMPORTANT: Must be a VALID email for Zendesk requester validation
-// Use your real domain here.
-const QA_REQUESTER_NAME = "AI Call Review";
-const QA_REQUESTER_EMAIL = "support@eviqo.io"; // <-- CHANGE if needed, but keep it valid
-
 // Safety limits for Zendesk comment body
-const MAX_TRANSCRIPT_CHARS = 30000; // safe-ish
-const MAX_VARS_JSON_CHARS = 6000; // collected variables block
-const MAX_CALL_SUMMARY_CHARS = 6000; // call summary
-const MAX_QA_BODY_CHARS = 60000; // final QA comment (hard cap)
+const MAX_TRANSCRIPT_CHARS = 30000;
+const MAX_VARS_JSON_CHARS = 6000;
+const MAX_CALL_SUMMARY_CHARS = 6000;
+const MAX_QA_BODY_CHARS = 60000;
 
 // ------------------------
 // Health-check endpoint
@@ -59,12 +53,23 @@ function safeJson(obj, maxChars) {
     const s = JSON.stringify(obj ?? {}, null, 2);
     return truncate(s, maxChars);
   } catch {
-    return '{\n  "error": "failed to stringify"\n}';
+    return "{\n  \"error\": \"failed to stringify\"\n}";
   }
 }
 
+function isValidEmail(email) {
+  const e = (email || "").trim();
+  // simple validation (enough for Zendesk requester field)
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+}
+
+function normalizeCallId(callId) {
+  const raw = (callId || "").toString().trim();
+  // tags cannot contain spaces; keep it safe
+  return raw.replace(/[^a-zA-Z0-9_\-]/g, "_");
+}
+
 function didTransfer(call) {
-  // 1) transcript_with_tool_calls can include tool_call_invocation
   const twtc = call?.transcript_with_tool_calls;
   if (Array.isArray(twtc)) {
     const has = twtc.some(
@@ -75,7 +80,6 @@ function didTransfer(call) {
     if (has) return true;
   }
 
-  // 2) call.tool_calls — array with {name,type,...}
   const toolCalls = call?.tool_calls;
   if (Array.isArray(toolCalls)) {
     const has = toolCalls.some((t) => safeLower(t?.name).includes("transfer"));
@@ -88,13 +92,11 @@ function didTransfer(call) {
 function detectRequestedHuman(transcript) {
   const t = safeLower(transcript);
 
-  // EN phrases
   const en =
     /\b(human|real person|live agent|representative|talk to someone|speak to someone|agent)\b/.test(
       t
     );
 
-  // UA/RU phrases (optional)
   const ua =
     /(жив(ий|ого)\s+агент|оператор|людин(а|у)|менеджер|з’єднай|з'єднай|переведи)/i.test(
       transcript || ""
@@ -105,11 +107,6 @@ function detectRequestedHuman(transcript) {
 
 /**
  * Business hours calculator in America/Los_Angeles
- * Returns:
- *  - business_hours: boolean
- *  - weekday: "Mon".."Sun"
- *  - time_hhmm: "HH:MM"
- *  - timezone: "America/Los_Angeles"
  */
 function getBusinessHoursNow() {
   const now = new Date();
@@ -127,21 +124,12 @@ function getBusinessHoursNow() {
   const weekday = part("weekday") || "Unknown";
   const hh = parseInt(part("hour") || "0", 10);
   const mm = parseInt(part("minute") || "0", 10);
-  const time_hhmm = `${String(hh).padStart(2, "0")}:${String(mm).padStart(
-    2,
-    "0"
-  )}`;
+  const time_hhmm = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
 
-  // Mon-Sat only
-  const isWorkingDay = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].includes(
-    weekday
-  );
+  const isWorkingDay = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].includes(weekday);
 
-  // >= 08:00 and < 20:00
-  const afterOpen =
-    hh > BH_OPEN_HOUR || (hh === BH_OPEN_HOUR && mm >= BH_OPEN_MIN);
-  const beforeClose =
-    hh < BH_CLOSE_HOUR || (hh === BH_CLOSE_HOUR && mm < BH_CLOSE_MIN);
+  const afterOpen = hh > BH_OPEN_HOUR || (hh === BH_OPEN_HOUR && mm >= BH_OPEN_MIN);
+  const beforeClose = hh < BH_CLOSE_HOUR || (hh === BH_CLOSE_HOUR && mm < BH_CLOSE_MIN);
 
   const business_hours = isWorkingDay && afterOpen && beforeClose;
 
@@ -163,7 +151,6 @@ function buildQaPayload(call) {
 
   const vars = call?.collected_dynamic_variables || {};
   const transcriptRaw = call?.transcript || "";
-
   const transcript = truncate(transcriptRaw, MAX_TRANSCRIPT_CHARS);
 
   const callSummaryRaw =
@@ -172,7 +159,6 @@ function buildQaPayload(call) {
     "";
 
   const callSummary = truncate(callSummaryRaw, MAX_CALL_SUMMARY_CHARS);
-
   const varsJson = safeJson(vars, MAX_VARS_JSON_CHARS);
 
   const body = [
@@ -200,15 +186,12 @@ function buildQaPayload(call) {
 function computeTags(call) {
   const tags = new Set();
 
-  // Base tags
   tags.add("retell_ai");
   tags.add("voice_bot");
   tags.add("ai_call_review");
 
-  // Call type tag
   if (call?.call_type) tags.add(`calltype_${safeLower(call.call_type)}`);
 
-  // Voicemail tag
   const inVoicemail = !!call?.call_analysis?.in_voicemail;
   tags.add(inVoicemail ? "voicemail_yes" : "voicemail_no");
 
@@ -218,7 +201,7 @@ function computeTags(call) {
   const transcript = call?.transcript || "";
   const requestedHuman = detectRequestedHuman(transcript);
 
-  const userSentiment = safeLower(call?.call_analysis?.user_sentiment); // positive/neutral/negative etc
+  const userSentiment = safeLower(call?.call_analysis?.user_sentiment);
   if (userSentiment) tags.add(`sentiment_${userSentiment}`);
   else tags.add("sentiment_unknown");
 
@@ -226,10 +209,8 @@ function computeTags(call) {
   const disconnectionReason = safeLower(call?.disconnection_reason);
 
   const userHungUp =
-    disconnectionReason.includes("user") ||
-    disconnectionReason.includes("client");
+    disconnectionReason.includes("user") || disconnectionReason.includes("client");
 
-  // Hangup classification
   if (userHungUp) {
     if (durationSec > 0 && durationSec < EARLY_HANGUP_THRESHOLD_SEC) {
       tags.add("ai_early_hangup");
@@ -238,19 +219,11 @@ function computeTags(call) {
     }
   }
 
-  // Success flag from Retell (if provided)
   const callSuccessful = call?.call_analysis?.call_successful;
   const hasCallSuccessful = typeof callSuccessful === "boolean";
 
-  // Outcome logic (mutually exclusive)
   let outcome = "ai_resolved";
 
-  // FAILED if:
-  // - transferred
-  // - requested human
-  // - sentiment negative
-  // - call_successful=false
-  // - late hangup
   if (
     transferred ||
     requestedHuman ||
@@ -261,18 +234,11 @@ function computeTags(call) {
     outcome = "ai_failed";
   }
 
-  // IMPORTANT exception:
-  // early_hangup should not automatically mark failed (often "no-chance")
-  if (
-    tags.has("ai_early_hangup") &&
-    !requestedHuman &&
-    userSentiment !== "negative"
-  ) {
+  if (tags.has("ai_early_hangup") && !requestedHuman && userSentiment !== "negative") {
     outcome = "ai_resolved";
     tags.add("ai_no_chance");
   }
 
-  // Ensure mutual exclusivity
   tags.delete("ai_resolved");
   tags.delete("ai_failed");
   tags.add(outcome);
@@ -309,36 +275,42 @@ async function zendeskRequest(path, method, bodyObj) {
   return { ok: resp.ok, status: resp.status, data };
 }
 
+async function findTicketIdByCallIdTag(call_id) {
+  if (!call_id) return null;
+
+  const tag = `callid_${normalizeCallId(call_id)}`;
+  // Zendesk search: type:ticket tags:callid_xxx
+  const query = encodeURIComponent(`type:ticket tags:${tag}`);
+  const { ok, status, data } = await zendeskRequest(`/search.json?query=${query}`, "GET");
+
+  if (!ok) {
+    console.error("Zendesk search failed:", status, data);
+    return null;
+  }
+
+  const results = data?.results || [];
+  const first = results.find((r) => r?.id);
+  return first?.id || null;
+}
+
 async function createQaTicketFromWebhook(call) {
   const callId = call?.call_id || "N/A";
   const qaBody = buildQaPayload(call);
   const tagsToAdd = computeTags(call);
 
+  // IMPORTANT: DO NOT set requester here (Zendesk may reject support / invalid emails)
   const payload = {
     ticket: {
       subject: `AI Voice Call Review — ${callId}`,
-      comment: {
-        body: qaBody,
-        public: false,
-      },
-      requester: {
-        name: QA_REQUESTER_NAME,
-        email: QA_REQUESTER_EMAIL, // ✅ valid now
-      },
+      comment: { body: qaBody, public: false },
       tags: tagsToAdd,
     },
   };
 
-  const { ok, status, data } = await zendeskRequest(
-    "/tickets.json",
-    "POST",
-    payload
-  );
+  const { ok, status, data } = await zendeskRequest("/tickets.json", "POST", payload);
   if (!ok) {
     throw new Error(
-      `Failed to create QA ticket. Zendesk status=${status} body=${JSON.stringify(
-        data
-      ).slice(0, 1000)}`
+      `Failed to create QA ticket. Zendesk status=${status} body=${JSON.stringify(data).slice(0, 1200)}`
     );
   }
   return data.ticket?.id;
@@ -350,15 +322,11 @@ async function createQaTicketFromWebhook(call) {
 app.post("/check-business-hours", (req, res) => {
   try {
     const info = getBusinessHoursNow();
-
-    // Optional: log call id if passed
     const call_id = req.body?.call_id || req.body?.args?.call_id;
     console.log("check-business-hours:", { call_id, ...info });
-
     res.json(info);
   } catch (err) {
     console.error("Error in /check-business-hours:", err);
-    // safest fallback: outside business hours
     res.json({
       business_hours: false,
       weekday: "Unknown",
@@ -371,7 +339,8 @@ app.post("/check-business-hours", (req, res) => {
 
 // ------------------------
 // Create ticket from Retell (function create_ticket)
-// NOTE: serial_number removed, phone added
+// serial_number removed, phone added
+// ADDED: call_id (optional) to tag the ticket for reliable webhook matching
 // ------------------------
 app.post("/create-ticket", async (req, res) => {
   try {
@@ -383,7 +352,7 @@ app.post("/create-ticket", async (req, res) => {
     const raw = req.body || {};
     const args = raw.args || raw.arguments || raw.parameters || raw;
 
-    const { name, email, issue_description, phone, car_model } = args || {};
+    const { name, email, issue_description, phone, car_model, call_id } = args || {};
 
     const bodyText =
       `Issue Description:\n${issue_description || "N/A"}\n\n` +
@@ -391,34 +360,35 @@ app.post("/create-ticket", async (req, res) => {
       `- Name: ${name || "N/A"}\n` +
       `- Email: ${email || "N/A"}\n` +
       `- Phone: ${phone || "N/A"}\n` +
-      `- Car Model: ${car_model || "N/A"}`;
+      `- Car Model: ${car_model || "N/A"}\n` +
+      `- Call ID: ${call_id || "N/A"}`;
+
+    const tags = ["retell_ai", "voice_bot", "ai_call_review"];
+
+    // Add call_id tag for matching in webhook
+    if (call_id) tags.push(`callid_${normalizeCallId(call_id)}`);
 
     const payload = {
       ticket: {
         subject: `AI Voice Bot — ${name || "Unknown"}`,
-        comment: {
-          body: bodyText,
-          public: false,
-        },
-        requester: {
-          name: name || QA_REQUESTER_NAME,
-          // ✅ if customer didn't provide email, we still must send a VALID email to Zendesk
-          email: email || QA_REQUESTER_EMAIL,
-        },
-        tags: ["retell_ai", "voice_bot", "ai_call_review"],
+        comment: { body: bodyText, public: false },
+        tags,
       },
     };
 
-    const { ok, status, data } = await zendeskRequest(
-      "/tickets.json",
-      "POST",
-      payload
-    );
+    // Only set requester if email is actually valid.
+    // If empty/invalid -> omit requester entirely to avoid Zendesk 422.
+    if (isValidEmail(email)) {
+      payload.ticket.requester = {
+        name: name || "Customer",
+        email: email.trim(),
+      };
+    }
+
+    const { ok, status, data } = await zendeskRequest("/tickets.json", "POST", payload);
     if (!ok) {
       console.error("Zendesk ticket create failed:", status, data);
-      return res
-        .status(500)
-        .json({ success: false, status, zendesk_response: data });
+      return res.status(500).json({ success: false, status, zendesk_response: data });
     }
 
     const ticketId = data.ticket?.id;
@@ -436,7 +406,7 @@ app.post("/create-ticket", async (req, res) => {
 });
 
 // -------------------------------------------
-// Webhook from Retell after call (call_ended/call_analyzed/etc.)
+// Webhook from Retell after call
 // -------------------------------------------
 app.post("/retell-webhook", async (req, res) => {
   try {
@@ -453,23 +423,28 @@ app.post("/retell-webhook", async (req, res) => {
     });
 
     if (!call) {
-      return res.json({
-        success: false,
-        message: "no call object in webhook payload",
-      });
+      return res.json({ success: false, message: "no call object in webhook payload" });
     }
 
+    // 1) Try ticket_id from Retell dynamic variables (best case)
     let ticket_id =
       call.retell_llm_dynamic_variables?.ticket_id ||
       call.metadata?.ticket_id ||
       call.variables?.ticket_id;
 
-    // If no ticket_id, create a QA ticket automatically
+    // 2) If missing, try to match escalation ticket by call_id tag
+    if (!ticket_id && call?.call_id) {
+      console.log("No ticket_id found. Trying to find ticket by call_id tag...");
+      ticket_id = await findTicketIdByCallIdTag(call.call_id);
+      if (ticket_id) console.log("Found ticket by call_id tag:", ticket_id);
+    }
+
+    // 3) If still missing, create a standalone QA ticket
     if (!ticket_id) {
-      console.log("No ticket_id found in payload. Creating QA ticket...");
-      ticket_id = await createQaTicketFromWebhook(call);
-      console.log("QA ticket created:", ticket_id);
-      return res.json({ success: true, created_qa_ticket: true, ticket_id });
+      console.log("No ticket match found. Creating standalone QA ticket...");
+      const qaTicketId = await createQaTicketFromWebhook(call);
+      console.log("Standalone QA ticket created:", qaTicketId);
+      return res.json({ success: true, created_qa_ticket: true, ticket_id: qaTicketId });
     }
 
     // Update existing ticket with QA data (transcript + summary + tags)
@@ -483,10 +458,7 @@ app.post("/retell-webhook", async (req, res) => {
 
     const updatePayload = {
       ticket: {
-        comment: {
-          body: qaBody,
-          public: false,
-        },
+        comment: { body: qaBody, public: false },
         additional_tags: tagsToAdd,
       },
     };
@@ -496,11 +468,10 @@ app.post("/retell-webhook", async (req, res) => {
       "PUT",
       updatePayload
     );
+
     if (!ok) {
       console.error("Zendesk ticket update failed:", status, data);
-      return res
-        .status(500)
-        .json({ success: false, status, zendesk_response: data });
+      return res.status(500).json({ success: false, status, zendesk_response: data });
     }
 
     console.log("Ticket updated with QA data:", data.ticket?.id);
@@ -512,7 +483,7 @@ app.post("/retell-webhook", async (req, res) => {
 });
 
 // ------------------------
-// Error handler (helps diagnose body parser issues cleanly)
+// Error handler
 // ------------------------
 app.use((err, req, res, next) => {
   if (err?.type === "entity.too.large") {
